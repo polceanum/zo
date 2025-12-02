@@ -441,6 +441,9 @@ def run_toy_problem(
     seed: int,
     cond: float,
     wandb_run=None,
+    record_traj: bool = False,
+    traj_dir: str = "toy_trajectories",
+    run_id: Optional[str] = None,
 ) -> Dict:
     torch.manual_seed(seed)
 
@@ -466,6 +469,11 @@ def run_toy_problem(
     optimizer = opt_fn(model.parameters(), lr=lr)
     is_zo = isinstance(optimizer, MeZO)
 
+    # record full parameter vector trajectory if requested and model has x
+    traj: Optional[List[np.ndarray]] = None
+    if record_traj and hasattr(model, "x"):
+        traj = []
+
     start_time = time.time()
     best_loss = float("inf")
     losses = []
@@ -486,6 +494,11 @@ def run_toy_problem(
         if loss_val < best_loss:
             best_loss = loss_val
 
+        if traj is not None:
+            # detach to avoid holding the graph, move to CPU NumPy
+            x_np = model.x.detach().cpu().numpy().copy()
+            traj.append(x_np)
+
         if wandb_run is not None and (step + 1) % max(steps // 10, 1) == 0:
             wandb_log(
                 wandb_run,
@@ -500,6 +513,30 @@ def run_toy_problem(
 
     elapsed = time.time() - start_time
 
+    traj_path = None
+    if traj is not None and len(traj) > 0:
+        os.makedirs(traj_dir, exist_ok=True)
+        traj_arr = np.stack(traj, axis=0)  # [steps, dim]
+        base_name = f"{problem_name}_{opt_name}_seed{seed}"
+        if run_id is not None:
+            base_name = f"{problem_name}_{opt_name}_seed{seed}_{run_id[:8]}"
+
+        traj_path = os.path.join(traj_dir, base_name + "_traj.npy")
+        meta_path = os.path.join(traj_dir, base_name + "_meta.json")
+
+        np.save(traj_path, traj_arr)
+        meta = {
+            "problem": problem_name,
+            "optimizer": opt_name,
+            "seed": seed,
+            "dim": int(traj_arr.shape[1]),
+            "steps": int(traj_arr.shape[0]),
+            "run_id": run_id,
+            "traj_path": os.path.abspath(traj_path),
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
     result = {
         "kind": "toy",
         "problem": problem_name,
@@ -510,12 +547,15 @@ def run_toy_problem(
         "final_loss": losses[-1],
         "best_loss": best_loss,
         "time_sec": elapsed,
+        "traj_path": traj_path,
     }
     print(
         f"-> FinalLoss={result['final_loss']:.6e} "
         f"BestLoss={result['best_loss']:.6e} "
         f"Time={result['time_sec']:.2f}s"
     )
+    if traj_path is not None:
+        print(f"   Trajectory saved to: {traj_path}")
     return result
 
 
@@ -748,7 +788,7 @@ def main():
 
     parser.add_argument("--ml-problems", type=str, nargs="*", default=["mnist"],
                         help="ML problems: mnist, fmnist")
-    parser.add_argument("--epochs", type=int, default=5,
+    parser.add_argument("--epochs", type=int, default=10,
                         help="Epochs for ML problems")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--test-batch-size", type=int, default=512)
@@ -771,6 +811,12 @@ def main():
 
     parser.add_argument("--results-path", type=str, default="results.json",
                         help="Path to JSON file for cached results")
+
+    # Toy trajectory saving
+    parser.add_argument("--save-toy-trajectories", action="store_true", default=False,
+                        help="If set, save parameter trajectories for toy problems")
+    parser.add_argument("--toy-traj-dir", type=str, default="toy_trajectories",
+                        help="Directory to save toy trajectories")
 
     # W&B options
     parser.add_argument("--wandb", action="store_true", default=False,
@@ -854,6 +900,9 @@ def main():
                     seed=seed,
                     cond=args.toy_cond,
                     wandb_run=wandb_run,
+                    record_traj=args.save_toy_trajectories,
+                    traj_dir=args.toy_traj_dir,
+                    run_id=run_id,
                 )
                 all_results.append(res)
                 runs_store[run_id] = {"config": config, "metrics": res}
