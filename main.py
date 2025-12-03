@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import tarfile
+import pickle
 
 from mezo import MeZO  # custom ZO optimizer
 
@@ -173,7 +175,7 @@ class NoisyQuadraticProblem(nn.Module):
 
 
 # ================================================================
-# Minimal MNIST / Fashion-MNIST loaders (no torchvision)
+# Minimal MNIST / Fashion-MNIST / CIFAR-10 loaders (no torchvision)
 # ================================================================
 
 MNIST_URLS = {
@@ -189,6 +191,8 @@ FASHION_URLS = {
     "test_images":  "http://fashion-mnist.s3-website.eu-central-1.amazonaws.com/t10k-images-idx3-ubyte.gz",
     "test_labels":  "http://fashion-mnist.s3-website.eu-central-1.amazonaws.com/t10k-labels-idx1-ubyte.gz",
 }
+
+CIFAR10_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
 
 
 def download_url(url: str, root: str, filename: str):
@@ -260,6 +264,72 @@ class MNISTLikeDataset(Dataset):
         return x, y
 
 
+class CIFAR10Dataset(Dataset):
+    """
+    CIFAR-10 loader (no torchvision), Python version:
+    https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz
+
+    Images: 3x32x32 color
+    """
+    def __init__(
+        self,
+        root: str,
+        train: bool = True,
+        normalize_mean=(0.4914, 0.4822, 0.4465),
+        normalize_std=(0.2470, 0.2435, 0.2616),
+    ):
+        self.root = root
+        self.train = train
+
+        os.makedirs(root, exist_ok=True)
+        archive_name = os.path.basename(CIFAR10_URL)  # cifar-10-python.tar.gz
+        archive_path = download_url(CIFAR10_URL, root, archive_name)
+
+        extract_dir = os.path.join(root, "cifar-10-batches-py")
+        if not os.path.isdir(extract_dir):
+            print(f"Extracting {archive_path} -> {extract_dir}")
+            with tarfile.open(archive_path, "r:gz") as tar:
+                tar.extractall(path=root)
+
+        if train:
+            batch_files = [f"data_batch_{i}" for i in range(1, 5 + 1)]
+        else:
+            batch_files = ["test_batch"]
+
+        images_list = []
+        labels_list = []
+
+        for bf in batch_files:
+            batch_path = os.path.join(extract_dir, bf)
+            with open(batch_path, "rb") as f:
+                entry = pickle.load(f, encoding="latin1")
+            data = entry["data"]  # [N, 3072]
+            labels = entry["labels"]  # list of ints
+
+            data = data.reshape(-1, 3, 32, 32)  # [N, 3, 32, 32]
+            images_list.append(torch.from_numpy(data))
+            labels_list.append(torch.tensor(labels, dtype=torch.long))
+
+        self.images = torch.cat(images_list, dim=0)
+        self.labels = torch.cat(labels_list, dim=0)
+
+        assert self.images.size(0) == self.labels.size(0)
+
+        mean = torch.tensor(normalize_mean).view(3, 1, 1)
+        std = torch.tensor(normalize_std).view(3, 1, 1)
+        self.normalize_mean = mean
+        self.normalize_std = std
+
+    def __len__(self):
+        return self.images.size(0)
+
+    def __getitem__(self, idx):
+        x = self.images[idx].float() / 255.0  # [3, 32, 32]
+        y = self.labels[idx]
+        x = (x - self.normalize_mean) / self.normalize_std
+        return x, y
+
+
 class SimpleCNN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -275,6 +345,36 @@ class SimpleCNN(nn.Module):
         x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
+
+
+class Cifar10CNN(nn.Module):
+    """
+    Slightly bigger CNN for CIFAR-10.
+    Still small enough to run easily on a MacBook Pro.
+    """
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),   # 32 -> 16
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),   # 16 -> 8
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256 * 8 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 10),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
         return F.log_softmax(x, dim=1)
 
 
@@ -302,6 +402,9 @@ def get_classification_loaders(
             "../data/fmnist", FASHION_URLS, train=False,
             normalize_mean=0.2860, normalize_std=0.3530
         )
+    elif dataset == "cifar10":
+        train_ds = CIFAR10Dataset("../data/cifar10", train=True)
+        test_ds = CIFAR10Dataset("../data/cifar10", train=False)
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -335,15 +438,17 @@ def build_optimizer_registry(zo_eps: float) -> Dict[str, Callable]:
         return _f
 
     registry = {
-        "sgd":               lambda params, lr: torch.optim.SGD(params, lr=lr),
-        "sgd_momentum":      lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
-        "adam":              lambda params, lr: torch.optim.Adam(params, lr=lr),
-        "adamw":             lambda params, lr: torch.optim.AdamW(params, lr=lr),
-        "rmsprop":           lambda params, lr: torch.optim.RMSprop(params, lr=lr),
-        "adagrad":           lambda params, lr: torch.optim.Adagrad(params, lr=lr),
-        "mezo_sgd":          mezo_factory("sgd"),
-        "mezo_adam":         mezo_factory("adam"),
-        "mezo_adamw":        mezo_factory("adamw"),
+        "sgd":                lambda params, lr: torch.optim.SGD(params, lr=lr),
+        "sgd_momentum":       lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
+        "adam":               lambda params, lr: torch.optim.Adam(params, lr=lr),
+        "adamw":              lambda params, lr: torch.optim.AdamW(params, lr=lr),
+        "rmsprop":            lambda params, lr: torch.optim.RMSprop(params, lr=lr),
+        "adagrad":            lambda params, lr: torch.optim.Adagrad(params, lr=lr),
+        "mezo_sgd":           mezo_factory("sgd"),
+        "mezo_adam":          mezo_factory("adam"),
+        "mezo_adamw":         mezo_factory("adamw"),
+        "mezo_adam_adapt":    mezo_factory("adam_adapt"),
+        "mezo_adam_adapt2":   mezo_factory("adam_adapt2"),
     }
     return registry
 
@@ -467,7 +572,8 @@ def run_toy_problem(
         raise ValueError(f"Unknown toy problem: {problem_name}")
 
     optimizer = opt_fn(model.parameters(), lr=lr)
-    is_zo = isinstance(optimizer, MeZO)
+    from mezo import MeZO as MeZOClass  # avoid name shadow in type-checkers
+    is_zo = isinstance(optimizer, MeZOClass)
 
     # record full parameter vector trajectory if requested and model has x
     traj: Optional[List[np.ndarray]] = None
@@ -495,7 +601,6 @@ def run_toy_problem(
             best_loss = loss_val
 
         if traj is not None:
-            # detach to avoid holding the graph, move to CPU NumPy
             x_np = model.x.detach().cpu().numpy().copy()
             traj.append(x_np)
 
@@ -637,9 +742,16 @@ def run_classification_problem(
         dataset, batch_size, test_batch_size, use_cuda=use_cuda
     )
 
-    model = SimpleCNN().to(device)
+    if dataset in ("mnist", "fmnist"):
+        model = SimpleCNN().to(device)
+    elif dataset == "cifar10":
+        model = Cifar10CNN().to(device)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
     optimizer = opt_fn(model.parameters(), lr=lr)
-    is_zo = isinstance(optimizer, MeZO)
+    from mezo import MeZO as MeZOClass  # avoid confusion in isinstance
+    is_zo = isinstance(optimizer, MeZOClass)
 
     start_time = time.time()
     best_acc = 0.0
@@ -786,8 +898,13 @@ def main():
     parser.add_argument("--toy-cond", type=float, default=10.0,
                         help="Condition number for quadratic/noisy_quadratic problem")
 
-    parser.add_argument("--ml-problems", type=str, nargs="*", default=["mnist"],
-                        help="ML problems: mnist, fmnist")
+    parser.add_argument(
+        "--ml-problems",
+        type=str,
+        nargs="*",
+        default=["mnist", "fmnist", "cifar10"],
+        help="ML problems: mnist, fmnist, cifar10",
+    )
     parser.add_argument("--epochs", type=int, default=10,
                         help="Epochs for ML problems")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -806,6 +923,8 @@ def main():
                             "mezo_sgd",
                             "mezo_adam",
                             "mezo_adamw",
+                            "mezo_adam_adapt",
+                            "mezo_adam_adapt2",
                         ],
                         help="Optimizers to benchmark")
 
