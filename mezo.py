@@ -20,6 +20,8 @@ class MeZO(Optimizer):
         - 'adamw'       : ZO-AdamW (decoupled weight decay)
         - 'adam_adapt'  : ZO-Adam + bold-driver style LR adaptation on loss
         - 'adam_adapt2' : ZO-Adam + gradient-statistics-based LR adaptation
+        - 'adam_adapt3' : ZO-Adam + combined loss+gradient LR adaptation
+                          (geometric mix of the two above)
 
     Key design choices:
       - Does NOT assume anything about the model (it may use dropout etc.).
@@ -34,12 +36,12 @@ class MeZO(Optimizer):
         params,
         lr: float = 1e-3,
         epsilon: float = 1e-3,
-        variant: str = "sgd",   # 'sgd', 'adam', 'adamw', 'adam_adapt', 'adam_adapt2'
+        variant: str = "sgd",   # 'sgd', 'adam', 'adamw', 'adam_adapt', 'adam_adapt2', 'adam_adapt3'
         betas=(0.9, 0.999),
         adam_eps: float = 1e-8,
         weight_decay: float = 0.0,
         projected_grad_clip: float | None = None,
-        # adaptive-LR controls (used by 'adam_adapt' and 'adam_adapt2')
+        # adaptive-LR controls (used by adapt/adapt2/adapt3)
         lr_min_factor: float = 0.1,
         lr_max_factor: float = 5.0,
         lr_inc_factor: float = 0.02,
@@ -47,16 +49,18 @@ class MeZO(Optimizer):
         adapt_warmup: int = 10,
         adapt_every: int = 5,
         adapt_worsen_tol: float = 1e-3,
-        # extra controls for the gradient-statistics variant ('adam_adapt2')
+        # extra controls for the gradient-statistics variant ('adam_adapt2'/'adam_adapt3')
         adapt2_beta: float = 0.95,
         adapt2_alpha: float = 0.1,
         adapt2_eps: float = 1e-8,
+        # mix weight for loss vs grad in adam_adapt3 (0 = only loss, 1 = only grad)
+        adapt3_mix_grad: float = 0.5,
     ):
         if lr <= 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if epsilon <= 0.0:
             raise ValueError(f"Invalid epsilon: {epsilon}")
-        if variant not in ("sgd", "adam", "adamw", "adam_adapt", "adam_adapt2"):
+        if variant not in ("sgd", "adam", "adamw", "adam_adapt", "adam_adapt2", "adam_adapt3"):
             raise ValueError(f"Unknown variant: {variant}")
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta1: {betas[0]}")
@@ -83,6 +87,8 @@ class MeZO(Optimizer):
             adapt2_beta=adapt2_beta,
             adapt2_alpha=adapt2_alpha,
             adapt2_eps=adapt2_eps,
+            # combined variant
+            adapt3_mix_grad=adapt3_mix_grad,
         )
         super().__init__(params, defaults)
 
@@ -140,10 +146,11 @@ class MeZO(Optimizer):
 
         - 'adam_adapt'  : bold-driver style, using the ZO loss.
         - 'adam_adapt2' : gradient-statistics style, using EMA of g_proj^2.
+        - 'adam_adapt3' : combines both in a geometric/log-space mix.
         """
         for group in self.param_groups:
             variant = group.get("variant", None)
-            if variant not in ("adam_adapt", "adam_adapt2"):
+            if variant not in ("adam_adapt", "adam_adapt2", "adam_adapt3"):
                 continue
 
             lr_min = group["lr_min_factor"]
@@ -225,6 +232,84 @@ class MeZO(Optimizer):
                 lr_scale_target = ref_gp_rms / gp_rms
 
                 # Clamp, then smooth to avoid jitter
+                lr_scale_target = max(lr_min, min(lr_max, lr_scale_target))
+                lr_scale = (1.0 - alpha) * lr_scale + alpha * lr_scale_target
+
+                adapt_state["lr_scale"] = lr_scale
+                group["lr"] = base_lr * lr_scale
+
+            elif variant == "adam_adapt3":
+                # -------- combined loss + gradient adaptation --------
+                adapt_state = group.setdefault("_adapt3_state", {})
+                base_lr = adapt_state.get("base_lr", group["lr"])
+                adapt_state["base_lr"] = base_lr
+
+                step = adapt_state.get("step", 0) + 1
+                adapt_state["step"] = step
+
+                lr_scale = adapt_state.get("lr_scale", 1.0)
+
+                # loss-based pieces
+                best_loss = adapt_state.get("best_loss", None)
+                lr_inc = group["lr_inc_factor"]
+                lr_dec = group["lr_dec_factor"]
+                worsen_tol = group["adapt_worsen_tol"]
+
+                # grad-based pieces
+                gp2_ema = adapt_state.get("gp2_ema", projected_grad * projected_grad)
+                beta = group["adapt2_beta"]
+                alpha = group["adapt2_alpha"]   # reuse same smoothing factor
+                eps_g = group["adapt2_eps"]
+                mix_grad = group["adapt3_mix_grad"]
+
+                # update EMA of grad^2
+                gp2_ema = beta * gp2_ema + (1.0 - beta) * (projected_grad * projected_grad)
+                adapt_state["gp2_ema"] = gp2_ema
+                gp_rms = math.sqrt(gp2_ema) + eps_g
+
+                # During warmup / non-adapt steps, just keep LR
+                if step <= warmup or (step % adapt_every) != 0:
+                    group["lr"] = base_lr * lr_scale
+                    adapt_state["lr_scale"] = lr_scale
+                    continue
+
+                # ---- 1) loss-based suggestion s_loss ----
+                s_loss = lr_scale
+                if best_loss is None:
+                    best_loss = avg_loss
+                else:
+                    if avg_loss < best_loss - 1e-12:
+                        best_loss = avg_loss
+                        s_loss = min(lr_scale * (1.0 + lr_inc), lr_max)
+                    elif avg_loss > best_loss * (1.0 + worsen_tol):
+                        s_loss = max(lr_scale * lr_dec, lr_min)
+                    # else: s_loss = lr_scale (no change)
+
+                adapt_state["best_loss"] = best_loss
+
+                # ---- 2) grad-based suggestion s_grad ----
+                ref_gp_rms = adapt_state.get("ref_gp_rms", None)
+                if ref_gp_rms is None:
+                    ref_gp_rms = gp_rms
+                    adapt_state["ref_gp_rms"] = ref_gp_rms
+                    s_grad = lr_scale  # no change yet
+                else:
+                    s_grad_target = ref_gp_rms / gp_rms
+                    s_grad_target = max(lr_min, min(lr_max, s_grad_target))
+                    s_grad = s_grad_target
+
+                # ---- 3) mix in log-space between s_loss and s_grad ----
+                # clamp to avoid log(0)
+                s_loss_clamped = max(lr_min, min(lr_max, s_loss))
+                s_grad_clamped = max(lr_min, min(lr_max, s_grad))
+
+                log_s_loss = math.log(s_loss_clamped)
+                log_s_grad = math.log(s_grad_clamped)
+                # mix_grad = 0 → only loss; 1 → only grad
+                log_target = (1.0 - mix_grad) * log_s_loss + mix_grad * log_s_grad
+                lr_scale_target = math.exp(log_target)
+
+                # ---- 4) smooth towards target, clamp ----
                 lr_scale_target = max(lr_min, min(lr_max, lr_scale_target))
                 lr_scale = (1.0 - alpha) * lr_scale + alpha * lr_scale_target
 
@@ -334,7 +419,13 @@ class MeZO(Optimizer):
                 continue
 
             decoupled_wd = (group["variant"] == "adamw")
-            use_adam = group["variant"] in ("adam", "adamw", "adam_adapt", "adam_adapt2")
+            use_adam = group["variant"] in (
+                "adam",
+                "adamw",
+                "adam_adapt",
+                "adam_adapt2",
+                "adam_adapt3",
+            )
 
             for p in params:
                 if not p.requires_grad:
