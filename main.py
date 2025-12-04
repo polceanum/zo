@@ -422,6 +422,311 @@ def get_classification_loaders(
 
 
 # ================================================================
+# BERT on Wikitext-2 MLM (Wikipedia-ish)
+# ================================================================
+
+def run_bert_wiki_mlm_problem(
+    dataset: str,
+    opt_name: str,
+    opt_fn: Callable,
+    epochs: int,
+    lr: float,               # this is the BERT LR (usually ~1e-5–5e-5)
+    batch_size: int,
+    test_batch_size: int,
+    device: torch.device,
+    use_cuda: bool,
+    seed: int,
+    wandb_run=None,
+) -> Dict:
+    """
+    BERT-base masked LM on Wikitext-2 (Wikipedia-ish).
+    Uses HuggingFace `datasets` + `transformers` with standard MLM setup.
+
+    For stability we use a BERT-specific LR (passed in as `lr`) and guard
+    against non-finite losses (both FO and ZO).
+    """
+    torch.manual_seed(seed)
+
+    from datasets import load_dataset
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForMaskedLM,
+        DataCollatorForLanguageModeling,
+    )
+
+    print("Loading Wikitext-2 dataset for BERT MLM...")
+    raw_datasets = load_dataset("wikitext", "wikitext-2-raw-v1")
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    # Slightly shorter seq length to save memory but still realistic
+    max_length = 64
+
+    def tokenize_function(examples):
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+        )
+
+    tokenized = raw_datasets.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=["text"],
+    )
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
+
+    train_ds = tokenized["train"]
+    eval_ds = tokenized["validation"]
+
+    # Keep runtime reasonable by sub-sampling
+    max_train_examples = 50000
+    max_eval_examples = 10000
+    if len(train_ds) > max_train_examples:
+        train_ds = train_ds.select(range(max_train_examples))
+    if len(eval_ds) > max_eval_examples:
+        eval_ds = eval_ds.select(range(max_eval_examples))
+
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=True, mlm_probability=0.15
+    )
+
+    # ---- cap effective BERT batch sizes to avoid OOM ----
+    bert_train_batch_size = min(batch_size, 8)
+    bert_eval_batch_size = min(test_batch_size, 16)
+
+    print(
+        f"Using BERT batch sizes: train={bert_train_batch_size}, "
+        f"eval={bert_eval_batch_size}, max_length={max_length}, lr={lr:g}"
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=bert_train_batch_size,
+        shuffle=True,
+        collate_fn=data_collator,
+    )
+    eval_loader = DataLoader(
+        eval_ds,
+        batch_size=bert_eval_batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
+    )
+
+    print("Loading BERT-base-uncased for MLM...")
+    model = AutoModelForMaskedLM.from_pretrained("bert-base-uncased")
+
+    # Some light memory tweaks (common in HF training)
+    model.resize_token_embeddings(len(tokenizer))  # in case tokenizer changed
+    model.config.use_cache = False  # disable cache for training
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        # Older transformers versions may not have this
+        pass
+
+    model.to(device)
+
+    optimizer = opt_fn(model.parameters(), lr=lr)
+    from mezo import MeZO as MeZOClass
+    is_zo = isinstance(optimizer, MeZOClass)
+
+    def evaluate() -> Dict[str, float]:
+        model.eval()
+        total_loss = 0.0
+        total_correct = 0
+        total_count = 0
+
+        print(f"[{dataset}] Opt={opt_name} Running evaluation...", flush=True)
+
+        with torch.no_grad():
+            total_eval_batches = len(eval_loader)
+            for batch_idx, batch in enumerate(eval_loader, start=1):
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                labels = batch["labels"]
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask", None),
+                    token_type_ids=batch.get("token_type_ids", None),
+                    labels=labels,
+                )
+                loss = outputs.loss
+                logits = outputs.logits  # [B, L, V]
+
+                mask = labels != -100
+                if mask.any():
+                    preds = logits.argmax(dim=-1)
+                    correct = (preds[mask] == labels[mask]).sum().item()
+                    count = mask.sum().item()
+                    total_correct += correct
+                    total_count += count
+
+                num_tokens = mask.sum().item()
+                if num_tokens == 0:
+                    num_tokens = 1
+                total_loss += float(loss.item()) * num_tokens
+
+                # light eval progress every ~10% of eval
+                if total_eval_batches > 0:
+                    log_every_eval = max(1, total_eval_batches // 10)
+                    if batch_idx % log_every_eval == 0 or batch_idx == total_eval_batches:
+                        print(
+                            f"[{dataset}] Opt={opt_name} Eval batch "
+                            f"{batch_idx}/{total_eval_batches}",
+                            flush=True,
+                        )
+
+        avg_loss = total_loss / max(1, total_count)
+        acc = 100.0 * total_correct / max(1, total_count) if total_count > 0 else 0.0
+        return {"loss": avg_loss, "accuracy": acc}
+
+    start_time = time.time()
+    best_acc = 0.0
+    best_eval_loss = float("inf")
+    last_eval_stats: Optional[Dict[str, float]] = None
+
+    total_batches = len(train_loader)
+    log_every = max(1, total_batches // 10)  # ~10 updates per epoch
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0.0
+        num_batches = 0
+
+        for batch_idx, batch in enumerate(train_loader, start=1):
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            labels = batch["labels"]
+
+            if is_zo:
+                # ----------------- ZO path with non-finite guards -----------------
+                def closure():
+                    out = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch.get("attention_mask", None),
+                        token_type_ids=batch.get("token_type_ids", None),
+                        labels=labels,
+                    )
+                    loss = out.loss
+                    if not torch.isfinite(loss):
+                        print(
+                            f"[{dataset}] Opt={opt_name} Epoch={epoch} "
+                            f"Batch={batch_idx}/{total_batches} "
+                            f"Non-finite ZO loss={loss.item()}, returning 0.",
+                            flush=True,
+                        )
+                        # Return a benign scalar so MeZO sees zero gradient
+                        return torch.zeros((), device=device, dtype=loss.dtype)
+                    return loss
+
+                loss_val = optimizer.step(closure)
+                # MeZO.step now has its own non-finite guard, but we double-check.
+                if (loss_val is None) or (not math.isfinite(loss_val)):
+                    print(
+                        f"[{dataset}] Opt={opt_name} Epoch={epoch} "
+                        f"Batch={batch_idx}/{total_batches} "
+                        f"MeZO step returned non-finite loss={loss_val}, "
+                        f"skipping logging for this batch.",
+                        flush=True,
+                    )
+                    continue
+
+            else:
+                # ----------------- FO path (already guarded) -----------------
+                optimizer.zero_grad()
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask", None),
+                    token_type_ids=batch.get("token_type_ids", None),
+                    labels=labels,
+                )
+                loss = out.loss
+
+                # ---- non-finite loss guard ----
+                if not torch.isfinite(loss):
+                    print(
+                        f"[{dataset}] Opt={opt_name} Epoch={epoch} "
+                        f"Batch={batch_idx}/{total_batches} "
+                        f"Non-finite loss={loss.item()}, skipping batch.",
+                        flush=True,
+                    )
+                    optimizer.zero_grad()
+                    continue
+
+                loss.backward()
+                # optional: gradient clipping if you want extra safety
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                loss_val = float(loss.item())
+
+            running_loss += loss_val
+            num_batches += 1
+
+            # ---- progress print every ~10% of the epoch ----
+            if batch_idx % log_every == 0 or batch_idx == total_batches:
+                avg_batch_loss = running_loss / max(1, num_batches)
+                print(
+                    f"[{dataset}] Opt={opt_name} Epoch={epoch}/{epochs} "
+                    f"Batch={batch_idx}/{total_batches} "
+                    f"RunningTrainLoss={avg_batch_loss:.4f}",
+                    flush=True,
+                )
+
+        train_loss = running_loss / max(1, num_batches) if num_batches > 0 else float("nan")
+        eval_stats = evaluate()
+        last_eval_stats = eval_stats
+
+        if eval_stats["accuracy"] > best_acc:
+            best_acc = eval_stats["accuracy"]
+        if eval_stats["loss"] < best_eval_loss:
+            best_eval_loss = eval_stats["loss"]
+
+        print(
+            f"[{dataset}] Opt={opt_name} Epoch={epoch}/{epochs} "
+            f"TrainLoss={train_loss:.4f} "
+            f"EvalLoss={eval_stats['loss']:.4f} "
+            f"EvalAcc={eval_stats['accuracy']:.2f}%",
+            flush=True,
+        )
+
+        if wandb_run is not None:
+            wandb_log(
+                wandb_run,
+                {
+                    "kind": "ml",
+                    "dataset": dataset,
+                    "optimizer": opt_name,
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "test_loss": eval_stats["loss"],
+                    "test_acc": eval_stats["accuracy"],
+                },
+            )
+
+    elapsed = time.time() - start_time
+
+    result = {
+        "kind": "ml",
+        "problem": dataset,
+        "optimizer": opt_name,
+        "epochs": epochs,
+        "seed": seed,
+        "final_test_loss": last_eval_stats["loss"] if last_eval_stats is not None else float("nan"),
+        "final_test_acc": last_eval_stats["accuracy"] if last_eval_stats is not None else 0.0,
+        "best_test_loss": best_eval_loss,
+        "best_test_acc": best_acc,
+        "time_sec": elapsed,
+    }
+    print(
+        f"-> FinalTestLoss={result['final_test_loss']:.4f} "
+        f"FinalTestAcc={result['final_test_acc']:.2f}% "
+        f"BestAcc={result['best_test_acc']:.2f}% "
+        f"Time={result['time_sec']:.2f}s"
+    )
+    return result
+
+
+# ================================================================
 # Optimizer registry
 # ================================================================
 
@@ -533,7 +838,7 @@ def wandb_log(run, metrics: Dict[str, Any]):
 
 
 # ================================================================
-# Training/eval loops
+# Training/eval loops (toy + image classification)
 # ================================================================
 
 def run_toy_problem(
@@ -773,7 +1078,8 @@ def run_classification_problem(
             f"[{dataset}] Opt={opt_name} Epoch={epoch}/{epochs} "
             f"TrainLoss={train_loss:.4f} "
             f"TestLoss={test_stats['loss']:.4f} "
-            f"TestAcc={test_stats['accuracy']:.2f}%"
+            f"TestAcc={test_stats['accuracy']:.2f}%",
+            flush=True,
         )
 
         if wandb_run is not None:
@@ -852,9 +1158,9 @@ def print_summaries(all_results: List[Dict]):
             for r in sorted(results, key=lambda x: x["optimizer"]):
                 print(
                     f"{r['optimizer']:<14} "
-                    f"{r['final_test_acc']:>14.2f} "
-                    f"{r['best_test_acc']:>14.2f} "
-                    f"{r['final_test_loss']:>14.4f} "
+                    f"{r.get('final_test_acc', 0.0):>14.2f} "
+                    f"{r.get('best_test_acc', 0.0):>14.2f} "
+                    f"{r.get('final_test_loss', 0.0):>14.4f} "
                     f"{r['time_sec']:>10.2f}"
                 )
 
@@ -903,15 +1209,17 @@ def main():
         "--ml-problems",
         type=str,
         nargs="*",
-        default=["mnist", "fmnist", "cifar10"],
-        help="ML problems: mnist, fmnist, cifar10",
+        default=["mnist", "fmnist", "cifar10", "bert_wiki_mlm"],
+        help="ML problems: mnist, fmnist, cifar10, bert_wiki_mlm",
     )
     parser.add_argument("--epochs", type=int, default=10,
                         help="Epochs for ML problems")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--test-batch-size", type=int, default=512)
     parser.add_argument("--ml-lr", type=float, default=1e-3,
-                        help="Learning rate for ML problems")
+                        help="Learning rate for non-BERT ML problems")
+    parser.add_argument("--bert-lr", type=float, default=5e-5,
+                        help="Learning rate for BERT MLM problems")
 
     parser.add_argument("--optimizers", type=str, nargs="*",
                         default=[
@@ -1035,6 +1343,21 @@ def main():
             for opt_name in optimizers_to_run:
                 opt_fn = opt_registry[opt_name]
 
+                if dataset == "bert_wiki_mlm":
+                    extra_cfg = {
+                        "epochs": args.epochs,
+                        "batch_size": args.batch_size,
+                        "test_batch_size": args.test_batch_size,
+                        "bert_lr": args.bert_lr,
+                    }
+                else:
+                    extra_cfg = {
+                        "epochs": args.epochs,
+                        "batch_size": args.batch_size,
+                        "test_batch_size": args.test_batch_size,
+                        "ml_lr": args.ml_lr,
+                    }
+
                 config = make_run_config(
                     kind="ml",
                     problem=dataset,
@@ -1042,12 +1365,7 @@ def main():
                     seed=seed,
                     device=device,
                     args=args,
-                    extra={
-                        "epochs": args.epochs,
-                        "batch_size": args.batch_size,
-                        "test_batch_size": args.test_batch_size,
-                        "ml_lr": args.ml_lr,
-                    },
+                    extra=extra_cfg,
                 )
                 run_id = run_id_from_config(config)
 
@@ -1059,19 +1377,35 @@ def main():
                     continue
 
                 print(f"\n[ML] Dataset={dataset} Opt={opt_name} Seed={seed}")
-                res = run_classification_problem(
-                    dataset=dataset,
-                    opt_name=opt_name,
-                    opt_fn=opt_fn,
-                    epochs=args.epochs,
-                    lr=args.ml_lr,
-                    batch_size=args.batch_size,
-                    test_batch_size=args.test_batch_size,
-                    device=device,
-                    use_cuda=use_cuda,
-                    seed=seed,
-                    wandb_run=wandb_run,
-                )
+                if dataset == "bert_wiki_mlm":
+                    res = run_bert_wiki_mlm_problem(
+                        dataset=dataset,
+                        opt_name=opt_name,
+                        opt_fn=opt_fn,
+                        epochs=args.epochs,
+                        lr=args.bert_lr,
+                        batch_size=args.batch_size,
+                        test_batch_size=args.test_batch_size,
+                        device=device,
+                        use_cuda=use_cuda,
+                        seed=seed,
+                        wandb_run=wandb_run,
+                    )
+                else:
+                    res = run_classification_problem(
+                        dataset=dataset,
+                        opt_name=opt_name,
+                        opt_fn=opt_fn,
+                        epochs=args.epochs,
+                        lr=args.ml_lr,
+                        batch_size=args.batch_size,
+                        test_batch_size=args.test_batch_size,
+                        device=device,
+                        use_cuda=use_cuda,
+                        seed=seed,
+                        wandb_run=wandb_run,
+                    )
+
                 all_results.append(res)
                 runs_store[run_id] = {"config": config, "metrics": res}
                 save_results_db(args.results_path, results_db)

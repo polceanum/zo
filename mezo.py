@@ -40,7 +40,7 @@ class MeZO(Optimizer):
         betas=(0.9, 0.999),
         adam_eps: float = 1e-8,
         weight_decay: float = 0.0,
-        projected_grad_clip: float | None = None,
+        projected_grad_clip: float | None = 5.0,
         # adaptive-LR controls (used by adapt/adapt2/adapt3)
         lr_min_factor: float = 0.1,
         lr_max_factor: float = 5.0,
@@ -148,6 +148,10 @@ class MeZO(Optimizer):
         - 'adam_adapt2' : gradient-statistics style, using EMA of g_proj^2.
         - 'adam_adapt3' : combines both in a geometric/log-space mix.
         """
+        if not math.isfinite(avg_loss):
+            # If the loss is already non-finite, don't try to adapt LR from it.
+            return
+
         for group in self.param_groups:
             variant = group.get("variant", None)
             if variant not in ("adam_adapt", "adam_adapt2", "adam_adapt3"):
@@ -391,13 +395,47 @@ class MeZO(Optimizer):
         loss_minus = closure()
         loss_minus_val = float(loss_minus.detach().item())
 
+        # ---------------- non-finite guard on losses ----------------
+        if (not math.isfinite(loss_plus_val)) or (not math.isfinite(loss_minus_val)):
+            # restore parameters to original θ and shrink LR a bit
+            print(
+                f"[MeZO] Non-finite ZO loss detected: "
+                f"loss_plus={loss_plus_val}, loss_minus={loss_minus_val}. "
+                f"Restoring parameters and reducing lr.",
+                flush=True,
+            )
+            for group in self.param_groups:
+                epsilon = group["epsilon"]
+                params = group["params"]
+                if not params:
+                    continue
+                for p in params:
+                    if not p.requires_grad:
+                        continue
+                    state = self.state[p]
+                    z = state.get("z", None)
+                    if z is None:
+                        continue
+                    # currently θ = θ - εz, so restore by +εz
+                    p.add_(epsilon * z)
+                # gentle LR backoff
+                group["lr"] *= 0.5
+            # return a big but finite loss so logs don't show NaNs
+            return float("inf")
+
         # scalar projected gradient
         projected_grad = (loss_plus_val - loss_minus_val) / (2.0 * eps)
+
+        # clip projected gradient if requested
         if proj_clip is not None:
             if projected_grad > proj_clip:
                 projected_grad = proj_clip
             elif projected_grad < -proj_clip:
                 projected_grad = -proj_clip
+
+        # if something still went wrong, zero it out
+        if not math.isfinite(projected_grad):
+            projected_grad = 0.0
 
         # Average loss (used for adaptive LR variants)
         avg_loss = 0.5 * (loss_plus_val + loss_minus_val)
