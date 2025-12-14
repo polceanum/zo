@@ -743,18 +743,29 @@ def build_optimizer_registry(zo_eps: float) -> Dict[str, Callable]:
         return _f
 
     registry = {
-        "sgd":                lambda params, lr: torch.optim.SGD(params, lr=lr),
-        "sgd_momentum":       lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
-        "adam":               lambda params, lr: torch.optim.Adam(params, lr=lr),
-        "adamw":              lambda params, lr: torch.optim.AdamW(params, lr=lr),
-        "rmsprop":            lambda params, lr: torch.optim.RMSprop(params, lr=lr),
-        "adagrad":            lambda params, lr: torch.optim.Adagrad(params, lr=lr),
-        "mezo_sgd":           mezo_factory("sgd"),
-        "mezo_adam":          mezo_factory("adam"),
-        "mezo_adamw":         mezo_factory("adamw"),
-        "mezo_adam_adapt":    mezo_factory("adam_adapt"),
-        "mezo_adam_adapt2":   mezo_factory("adam_adapt2"),
-        "mezo_adam_adapt3":   mezo_factory("adam_adapt3"),
+        # First-order
+        "sgd":                  lambda params, lr: torch.optim.SGD(params, lr=lr),
+        "sgd_momentum":         lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
+        "adam":                 lambda params, lr: torch.optim.Adam(params, lr=lr),
+        "adamw":                lambda params, lr: torch.optim.AdamW(params, lr=lr),
+        "rmsprop":              lambda params, lr: torch.optim.RMSprop(params, lr=lr),
+        "adagrad":              lambda params, lr: torch.optim.Adagrad(params, lr=lr),
+
+        # Zeroth-order MeZO variants
+        "mezo_sgd":             mezo_factory("sgd"),
+        "mezo_sgd_adapt":      mezo_factory("sgd_adapt"),
+        "mezo_sgd_adapt2":     mezo_factory("sgd_adapt2"),
+        "mezo_sgd_adapt3":     mezo_factory("sgd_adapt3"),
+
+        "mezo_adam":           mezo_factory("adam"),
+        "mezo_adam_adapt":     mezo_factory("adam_adapt"),
+        "mezo_adam_adapt2":    mezo_factory("adam_adapt2"),
+        "mezo_adam_adapt3":    mezo_factory("adam_adapt3"),
+
+        "mezo_adamw":          mezo_factory("adamw"),
+        "mezo_adamw_adapt":    mezo_factory("adamw_adapt"),
+        "mezo_adamw_adapt2":   mezo_factory("adamw_adapt2"),
+        "mezo_adamw_adapt3":   mezo_factory("adamw_adapt3"),
     }
     return registry
 
@@ -1209,7 +1220,7 @@ def main():
         "--ml-problems",
         type=str,
         nargs="*",
-        default=["mnist", "fmnist", "cifar10", "bert_wiki_mlm"],
+        default=["mnist", "fmnist", "cifar10"], # "bert_wiki_mlm"
         help="ML problems: mnist, fmnist, cifar10, bert_wiki_mlm",
     )
     parser.add_argument("--epochs", type=int, default=10,
@@ -1221,22 +1232,32 @@ def main():
     parser.add_argument("--bert-lr", type=float, default=5e-5,
                         help="Learning rate for BERT MLM problems")
 
-    parser.add_argument("--optimizers", type=str, nargs="*",
-                        default=[
-                            "sgd",
-                            "sgd_momentum",
-                            "adam",
-                            "adamw",
-                            "rmsprop",
-                            "adagrad",
-                            "mezo_sgd",
-                            "mezo_adam",
-                            "mezo_adamw",
-                            "mezo_adam_adapt",
-                            "mezo_adam_adapt2",
-                            "mezo_adam_adapt3",
-                        ],
-                        help="Optimizers to benchmark")
+    parser.add_argument(
+        "--optimizers",
+        type=str,
+        nargs="*",
+        default=[
+            "sgd",
+            "sgd_momentum",
+            "adam",
+            "adamw",
+            "rmsprop",
+            "adagrad",
+            "mezo_sgd",
+            "mezo_sgd_adapt",
+            "mezo_sgd_adapt2",
+            "mezo_sgd_adapt3",
+            "mezo_adam",
+            "mezo_adamw",
+            "mezo_adam_adapt",
+            "mezo_adam_adapt2",
+            "mezo_adam_adapt3",
+            "mezo_adamw_adapt",
+            "mezo_adamw_adapt2",
+            "mezo_adamw_adapt3",
+        ],
+        help="Optimizers to benchmark",
+    )
 
     parser.add_argument("--results-path", type=str, default="results.json",
                         help="Path to JSON file for cached results")

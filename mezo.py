@@ -15,13 +15,18 @@ class MeZO(Optimizer):
         ĝ ≈ ((L(θ + εz) - L(θ - εz)) / (2ε)) * z
 
     Variants:
-        - 'sgd'         : ZO-SGD
-        - 'adam'        : ZO-Adam (coupled weight decay)
-        - 'adamw'       : ZO-AdamW (decoupled weight decay)
-        - 'adam_adapt'  : ZO-Adam + bold-driver style LR adaptation on loss
-        - 'adam_adapt2' : ZO-Adam + gradient-statistics-based LR adaptation
-        - 'adam_adapt3' : ZO-Adam + combined loss+gradient LR adaptation
-                          (geometric mix of the two above)
+        - 'sgd'              : ZO-SGD
+        - 'sgd_adapt'        : ZO-SGD with loss-based adaptive LR
+        - 'sgd_adapt2'       : ZO-SGD with grad-statistics adaptive LR
+        - 'sgd_adapt3'       : ZO-SGD with combined loss+grad adaptive LR
+        - 'adam'             : ZO-Adam (coupled weight decay)
+        - 'adamw'            : ZO-AdamW (decoupled weight decay)
+        - 'adam_adapt'       : ZO-Adam + bold-driver style LR adaptation on loss
+        - 'adam_adapt2'      : ZO-Adam + gradient-statistics-based LR adaptation
+        - 'adam_adapt3'      : ZO-Adam + combined loss+gradient LR adaptation
+        - 'adamw_adapt'      : ZO-AdamW + loss-based LR adaptation
+        - 'adamw_adapt2'     : ZO-AdamW + grad-statistics LR adaptation
+        - 'adamw_adapt3'     : ZO-AdamW + combined loss+grad LR adaptation
 
     Key design choices:
       - Does NOT assume anything about the model (it may use dropout etc.).
@@ -36,7 +41,11 @@ class MeZO(Optimizer):
         params,
         lr: float = 1e-3,
         epsilon: float = 1e-3,
-        variant: str = "sgd",   # 'sgd', 'adam', 'adamw', 'adam_adapt', 'adam_adapt2', 'adam_adapt3'
+        variant: str = "sgd",
+        # variants: 'sgd', 'sgd_adapt', 'sgd_adapt2', 'sgd_adapt3',
+        #           'adam', 'adamw',
+        #           'adam_adapt', 'adam_adapt2', 'adam_adapt3',
+        #           'adamw_adapt', 'adamw_adapt2', 'adamw_adapt3'
         betas=(0.9, 0.999),
         adam_eps: float = 1e-8,
         weight_decay: float = 0.0,
@@ -49,18 +58,33 @@ class MeZO(Optimizer):
         adapt_warmup: int = 10,
         adapt_every: int = 5,
         adapt_worsen_tol: float = 1e-3,
-        # extra controls for the gradient-statistics variant ('adam_adapt2'/'adam_adapt3')
+        # extra controls for the gradient-statistics variant ('*_adapt2'/'*_adapt3')
         adapt2_beta: float = 0.95,
         adapt2_alpha: float = 0.1,
         adapt2_eps: float = 1e-8,
-        # mix weight for loss vs grad in adam_adapt3 (0 = only loss, 1 = only grad)
+        # mix weight for loss vs grad in *_adapt3 (0 = only loss, 1 = only grad)
         adapt3_mix_grad: float = 0.5,
     ):
         if lr <= 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if epsilon <= 0.0:
             raise ValueError(f"Invalid epsilon: {epsilon}")
-        if variant not in ("sgd", "adam", "adamw", "adam_adapt", "adam_adapt2", "adam_adapt3"):
+
+        valid_variants = {
+            "sgd",
+            "sgd_adapt",
+            "sgd_adapt2",
+            "sgd_adapt3",
+            "adam",
+            "adamw",
+            "adam_adapt",
+            "adam_adapt2",
+            "adam_adapt3",
+            "adamw_adapt",
+            "adamw_adapt2",
+            "adamw_adapt3",
+        }
+        if variant not in valid_variants:
             raise ValueError(f"Unknown variant: {variant}")
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta1: {betas[0]}")
@@ -144,9 +168,9 @@ class MeZO(Optimizer):
         """
         Update per-group learning rates for adaptive variants.
 
-        - 'adam_adapt'  : bold-driver style, using the ZO loss.
-        - 'adam_adapt2' : gradient-statistics style, using EMA of g_proj^2.
-        - 'adam_adapt3' : combines both in a geometric/log-space mix.
+        - '*_adapt'  : bold-driver style, using the ZO loss.
+        - '*_adapt2' : gradient-statistics style, using EMA of g_proj^2.
+        - '*_adapt3' : combines both in a geometric/log-space mix.
         """
         if not math.isfinite(avg_loss):
             # If the loss is already non-finite, don't try to adapt LR from it.
@@ -154,15 +178,23 @@ class MeZO(Optimizer):
 
         for group in self.param_groups:
             variant = group.get("variant", None)
-            if variant not in ("adam_adapt", "adam_adapt2", "adam_adapt3"):
-                continue
+
+            # Map concrete variants to adaptation families
+            if variant in ("adam_adapt", "adamw_adapt", "sgd_adapt"):
+                family = "adapt_loss"
+            elif variant in ("adam_adapt2", "adamw_adapt2", "sgd_adapt2"):
+                family = "adapt_grad"
+            elif variant in ("adam_adapt3", "adamw_adapt3", "sgd_adapt3"):
+                family = "adapt_both"
+            else:
+                continue  # non-adaptive variant
 
             lr_min = group["lr_min_factor"]
             lr_max = group["lr_max_factor"]
             warmup = group["adapt_warmup"]
             adapt_every = group["adapt_every"]
 
-            if variant == "adam_adapt":
+            if family == "adapt_loss":
                 # -------- loss-based bold-driver adaptation --------
                 adapt_state = group.setdefault("_adapt_state", {})
                 base_lr = adapt_state.get("base_lr", group["lr"])
@@ -195,7 +227,7 @@ class MeZO(Optimizer):
                 adapt_state["lr_scale"] = lr_scale
                 group["lr"] = base_lr * lr_scale
 
-            elif variant == "adam_adapt2":
+            elif family == "adapt_grad":
                 # -------- gradient-statistics based adaptation --------
                 adapt_state = group.setdefault("_adapt2_state", {})
                 base_lr = adapt_state.get("base_lr", group["lr"])
@@ -242,7 +274,7 @@ class MeZO(Optimizer):
                 adapt_state["lr_scale"] = lr_scale
                 group["lr"] = base_lr * lr_scale
 
-            elif variant == "adam_adapt3":
+            elif family == "adapt_both":
                 # -------- combined loss + gradient adaptation --------
                 adapt_state = group.setdefault("_adapt3_state", {})
                 base_lr = adapt_state.get("base_lr", group["lr"])
@@ -456,14 +488,11 @@ class MeZO(Optimizer):
             if not params:
                 continue
 
-            decoupled_wd = (group["variant"] == "adamw")
-            use_adam = group["variant"] in (
-                "adam",
-                "adamw",
-                "adam_adapt",
-                "adam_adapt2",
-                "adam_adapt3",
-            )
+            variant = group["variant"]
+            use_sgd = variant.startswith("sgd")
+            use_adam = variant.startswith("adam")
+            # 'adamw' + any adapt variant: decoupled wd
+            decoupled_wd = variant.startswith("adamw")
 
             for p in params:
                 if not p.requires_grad:
@@ -475,14 +504,16 @@ class MeZO(Optimizer):
                 # restore parameters: θ <- θ + εz (back to original θ)
                 p.add_(epsilon * z)
 
-                if group["variant"] == "sgd":
+                if use_sgd:
                     # ZO-SGD: θ <- θ - lr * (proj_grad * z [+ wd])
                     gparam = projected_grad * z
                     if weight_decay != 0.0:
+                        # classic coupled weight decay (like SGD w/ wd)
                         gparam.add_(p.data, alpha=weight_decay)
                     p.add_(gparam, alpha=-lr)
+
                 elif use_adam:
-                    # ZO-Adam / ZO-AdamW / ZO-Adam with adaptive LR
+                    # ZO-Adam / ZO-AdamW / ZO-Adam* with adaptive LR
                     grad_est = projected_grad * z
 
                     if "step" not in state:
@@ -496,7 +527,7 @@ class MeZO(Optimizer):
                     state["step"] += 1
                     step_t = state["step"]
 
-                    # coupled weight decay (Adam-style)
+                    # coupled weight decay (Adam-style) if not decoupled
                     if weight_decay != 0.0 and not decoupled_wd:
                         grad_est.add_(p.data, alpha=weight_decay)
 
@@ -510,12 +541,13 @@ class MeZO(Optimizer):
                     denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(adam_eps)
                     step_size = lr / bias_correction1
 
-                    # decoupled weight decay (AdamW)
+                    # decoupled weight decay (AdamW-style)
                     if weight_decay != 0.0 and decoupled_wd:
                         p.data.mul_(1 - lr * weight_decay)
 
                     p.addcdiv_(exp_avg, denom, value=-step_size)
+
                 else:
-                    raise RuntimeError(f"Unsupported MeZO variant in step(): {group['variant']}")
+                    raise RuntimeError(f"Unsupported MeZO variant in step(): {variant}")
 
         return avg_loss
