@@ -83,6 +83,7 @@ class MeZO(Optimizer):
             "adamw_adapt",
             "adamw_adapt2",
             "adamw_adapt3",
+            "adamu",
         }
         if variant not in valid_variants:
             raise ValueError(f"Unknown variant: {variant}")
@@ -184,7 +185,8 @@ class MeZO(Optimizer):
                 family = "adapt_loss"
             elif variant in ("adam_adapt2", "adamw_adapt2", "sgd_adapt2"):
                 family = "adapt_grad"
-            elif variant in ("adam_adapt3", "adamw_adapt3", "sgd_adapt3"):
+            elif variant in ("adam_adapt3", "adamw_adapt3",
+            "adamu", "sgd_adapt3"):
                 family = "adapt_both"
             else:
                 continue  # non-adaptive variant
@@ -352,7 +354,65 @@ class MeZO(Optimizer):
                 adapt_state["lr_scale"] = lr_scale
                 group["lr"] = base_lr * lr_scale
 
+
+
+    # ---------------- ZO-AdaMU helpers ----------------
+
+    @staticmethod
+    def _adamu_anneal_weight(t: int, T1: int, T2: int, T3: int, phi: float) -> float:
+        """
+        Paper-matching simulated annealing weight (Eq. 7 in the ZO-AdaMU paper).
+
+        Returns a scalar w in [0, 1] used to interpolate between (start -> end) on t ∈ [T1, T2).
+        """
+        if t < T1:
+            return 1.0
+        if t >= T2:
+            return 0.0
+        # Eq. (7): 0.5 + 0.5 cos( π * ((T3−T1)/(T3−t^φ)) * ((T3−T2)/(T2−T1)) )
+        # We interpret this as an annealing *weight* and then map to each parameter's range.
+        denom = float(T3) - float(t) ** float(phi)
+        # guard for pathological configs
+        if denom <= 1e-12:
+            return 0.0
+        ratio = ((float(T3) - float(T1)) / denom) * ((float(T3) - float(T2)) / float(max(1, T2 - T1)))
+        w = 0.5 + 0.5 * math.cos(math.pi * ratio)
+        # clamp for numerical safety
+        return float(max(0.0, min(1.0, w)))
+
+    @classmethod
+    def _adamu_anneal(cls, t: int, T1: int, T2: int, T3: int) -> tuple[float, float, float]:
+        """
+        Simulated-annealing schedule for (alpha, beta1, beta2) in ZO-AdaMU.
+
+        Matches Algorithm 1 / Eq. (7):
+          - warm-up t ∈ [1, T1): no momentum influence (pure SPSA)
+          - anneal t ∈ [T1, T2): transition via Eq. (7) with different φ values
+          - fixed t ∈ [T2, T3): (alpha=0.5, beta1=0.9, beta2=0.01)
+          - if t >= T3: keep final values
+
+        φ values: 1 for alpha, 0.1 for beta1, 1.5 for beta2.
+        """
+        # Stage 1 (warm-up): pure SPSA-like perturbation.
+        if t < T1:
+            return 1.0, 1.0, 1.0
+
+        # Stage 3+ (fixed): stability / convergence.
+        if t >= T2:
+            return 0.5, 0.9, 0.01
+
+        # Stage 2 (anneal): interpolate from warm-up (1.0) to final.
+        w_alpha = cls._adamu_anneal_weight(t, T1, T2, T3, phi=1.0)
+        w_b1 = cls._adamu_anneal_weight(t, T1, T2, T3, phi=0.1)
+        w_b2 = cls._adamu_anneal_weight(t, T1, T2, T3, phi=1.5)
+
+        alpha = 0.5 + (1.0 - 0.5) * w_alpha      # 1.0 -> 0.5
+        beta1 = 0.9 + (1.0 - 0.9) * w_b1         # 1.0 -> 0.9
+        beta2 = 0.01 + (1.0 - 0.01) * w_b2       # 1.0 -> 0.01
+        return float(alpha), float(beta1), float(beta2)
+
     # ---------------- main step() ----------------
+
 
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor] | None = None):
@@ -392,16 +452,47 @@ class MeZO(Optimizer):
             params = group["params"]
             if not params:
                 continue
+
+            variant = group.get("variant", "sgd")
+            is_adamu = variant == "adamu"
+            if is_adamu:
+                # Global step counter per param-group (matches the paper's t).
+                t = int(group.get("adamu_step", 0)) + 1
+                group["adamu_step"] = t
+                T1 = int(group.get("adamu_T1", 100))
+                T2 = int(group.get("adamu_T2", 1600))
+                T3 = int(group.get("adamu_T3", 2000))
+                alpha, beta1, beta2 = self._adamu_anneal(t, T1, T2, T3)
+
             for p in params:
                 if not p.requires_grad:
                     continue
                 state = self.state[p]
-                # persistent noise buffer
-                if "z" not in state:
-                    state["z"] = torch.empty_like(p)
-                z = state["z"]
-                z.normal_(generator=gen)  # in-place sample
-                p.add_(epsilon * z)
+                if is_adamu:
+                    # ZO-AdaMU: sample a stochastic momentum direction m_t (Algorithm 1).
+                    if "m" not in state:
+                        state["m"] = torch.zeros_like(p)
+                        state["v"] = torch.zeros_like(p)
+                    m_prev = state["m"]
+
+                    # z_dot ~ N(0, sqrt(alpha) I), z_ddot ~ N(m_prev, sqrt(1-alpha) I)
+                    z_dot = torch.randn(p.shape, device=p.device, dtype=p.dtype, generator=gen) * math.sqrt(max(alpha, 0.0))
+                    z_ddot = torch.randn(p.shape, device=p.device, dtype=p.dtype, generator=gen) * math.sqrt(max(1.0 - alpha, 0.0)) + m_prev
+
+                    m_t = beta1 * z_dot + (1.0 - beta1) * z_ddot
+                    v_t = beta2 * (z_dot * z_dot) + (1.0 - beta2) * (z_ddot * z_ddot)
+                    state["m"] = m_t
+                    state["v"] = v_t
+
+                    # Use m_t as the perturbation direction.
+                    p.add_(epsilon * m_t)
+                else:
+                    # persistent noise buffer
+                    if "z" not in state:
+                        state["z"] = torch.empty_like(p)
+                    z = state["z"]
+                    z.normal_(generator=gen)  # in-place sample
+                    p.add_(epsilon * z)
 
         # f(θ + εz) with restored RNG
         self._restore_rng_state(device, rng_state)
@@ -416,12 +507,17 @@ class MeZO(Optimizer):
             params = group["params"]
             if not params:
                 continue
+            is_adamu = group.get("variant", "") == "adamu"
             for p in params:
                 if not p.requires_grad:
                     continue
-                z = self.state[p]["z"]
-                p.add_(-2.0 * epsilon * z)
-
+                state = self.state[p]
+                if is_adamu:
+                    m_t = state["m"]
+                    p.add_(-2.0 * epsilon * m_t)
+                else:
+                    z = state["z"]
+                    p.add_(-2.0 * epsilon * z)
         # f(θ - εz) with the *same* RNG stream
         self._restore_rng_state(device, rng_state)
         loss_minus = closure()
@@ -445,11 +541,17 @@ class MeZO(Optimizer):
                     if not p.requires_grad:
                         continue
                     state = self.state[p]
-                    z = state.get("z", None)
-                    if z is None:
-                        continue
-                    # currently θ = θ - εz, so restore by +εz
-                    p.add_(epsilon * z)
+                    if group.get("variant", "") == "adamu":
+                        m_t = state.get("m", None)
+                        if m_t is not None:
+                            # currently θ = θ - ε m_t, so restore by +ε m_t
+                            p.add_(epsilon * m_t)
+                    else:
+                        z = state.get("z", None)
+                        if z is None:
+                            continue
+                        # currently θ = θ - εz, so restore by +εz
+                        p.add_(epsilon * z)
                 # gentle LR backoff
                 group["lr"] *= 0.5
             # return a big but finite loss so logs don't show NaNs
@@ -499,6 +601,23 @@ class MeZO(Optimizer):
                     continue
 
                 state = self.state[p]
+                if variant == "adamu":
+                    m_t = state["m"]
+                    v_t = state["v"]
+                    # restore parameters: θ <- θ + ε m_t (back to original θ)
+                    p.add_(epsilon * m_t)
+
+                    sigma = float(group.get("adamu_sigma", 1e-8))
+                    if weight_decay != 0.0:
+                        # The original paper typically uses wd=0.
+                        # If enabled, apply decoupled weight decay for stability.
+                        p.add_(p.data, alpha=-lr * weight_decay)
+
+                    denom = torch.sqrt(v_t) + sigma
+                    update = (projected_grad * m_t) / denom
+                    p.add_(update, alpha=-lr)
+                    continue
+
                 z = state["z"]
 
                 # restore parameters: θ <- θ + εz (back to original θ)

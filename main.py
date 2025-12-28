@@ -766,6 +766,9 @@ def build_optimizer_registry(zo_eps: float) -> Dict[str, Callable]:
         "mezo_adamw_adapt":    mezo_factory("adamw_adapt"),
         "mezo_adamw_adapt2":   mezo_factory("adamw_adapt2"),
         "mezo_adamw_adapt3":   mezo_factory("adamw_adapt3"),
+
+        # ZO-AdaMU baseline (from the ZO-AdaMU paper): adaptive perturbation + momentum.
+        "mezo_adamu":          mezo_factory("adamu"),
     }
     return registry
 
@@ -1255,6 +1258,7 @@ def main():
             "mezo_adamw_adapt",
             "mezo_adamw_adapt2",
             "mezo_adamw_adapt3",
+            "mezo_adamu",
         ],
         help="Optimizers to benchmark",
     )
