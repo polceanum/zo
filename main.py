@@ -758,12 +758,10 @@ def build_optimizer_registry(zo_eps: float) -> Dict[str, Callable]:
         "mezo_sgd_adapt3":     mezo_factory("sgd_adapt3"),
 
         "mezo_adam":           mezo_factory("adam"),
-        "mezo_adam_adapt":     mezo_factory("adam_adapt"),
         "mezo_adam_adapt2":    mezo_factory("adam_adapt2"),
         "mezo_adam_adapt3":    mezo_factory("adam_adapt3"),
 
         "mezo_adamw":          mezo_factory("adamw"),
-        "mezo_adamw_adapt":    mezo_factory("adamw_adapt"),
         "mezo_adamw_adapt2":   mezo_factory("adamw_adapt2"),
         "mezo_adamw_adapt3":   mezo_factory("adamw_adapt3"),
 
@@ -1252,10 +1250,8 @@ def main():
             "mezo_sgd_adapt3",
             "mezo_adam",
             "mezo_adamw",
-            "mezo_adam_adapt",
             "mezo_adam_adapt2",
             "mezo_adam_adapt3",
-            "mezo_adamw_adapt",
             "mezo_adamw_adapt2",
             "mezo_adamw_adapt3",
             "mezo_adamu",

@@ -21,12 +21,10 @@ class MeZO(Optimizer):
         - 'sgd_adapt3'       : ZO-SGD with combined loss+grad adaptive LR
         - 'adam'             : ZO-Adam (coupled weight decay)
         - 'adamw'            : ZO-AdamW (decoupled weight decay)
-        - 'adam_adapt'       : ZO-Adam + bold-driver style LR adaptation on loss
         - 'adam_adapt2'      : ZO-Adam + gradient-statistics-based LR adaptation
-        - 'adam_adapt3'      : ZO-Adam + combined loss+gradient LR adaptation
-        - 'adamw_adapt'      : ZO-AdamW + loss-based LR adaptation
+        - 'adam_adapt3'      : ZO-Adam + bold-driver loss + gradient LR adaptation
         - 'adamw_adapt2'     : ZO-AdamW + grad-statistics LR adaptation
-        - 'adamw_adapt3'     : ZO-AdamW + combined loss+grad LR adaptation
+        - 'adamw_adapt3'     : ZO-AdamW + bold-driver loss + grad LR adaptation
 
     Key design choices:
       - Does NOT assume anything about the model (it may use dropout etc.).
@@ -44,8 +42,8 @@ class MeZO(Optimizer):
         variant: str = "sgd",
         # variants: 'sgd', 'sgd_adapt', 'sgd_adapt2', 'sgd_adapt3',
         #           'adam', 'adamw',
-        #           'adam_adapt', 'adam_adapt2', 'adam_adapt3',
-        #           'adamw_adapt', 'adamw_adapt2', 'adamw_adapt3'
+        #           'adam_adapt2', 'adam_adapt3',
+        #           'adamw_adapt2', 'adamw_adapt3'
         betas=(0.9, 0.999),
         adam_eps: float = 1e-8,
         weight_decay: float = 0.0,
@@ -77,10 +75,8 @@ class MeZO(Optimizer):
             "sgd_adapt3",
             "adam",
             "adamw",
-            "adam_adapt",
             "adam_adapt2",
             "adam_adapt3",
-            "adamw_adapt",
             "adamw_adapt2",
             "adamw_adapt3",
             "adamu",
@@ -181,7 +177,7 @@ class MeZO(Optimizer):
             variant = group.get("variant", None)
 
             # Map concrete variants to adaptation families
-            if variant in ("adam_adapt", "adamw_adapt", "sgd_adapt"):
+            if variant in ("sgd_adapt"):
                 family = "adapt_loss"
             elif variant in ("adam_adapt2", "adamw_adapt2", "sgd_adapt2"):
                 family = "adapt_grad"
