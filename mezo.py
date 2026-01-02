@@ -17,21 +17,7 @@ class MeZO(Optimizer):
     Variants:
         - 'sgd'              : ZO-SGD
         - 'sgd_adapt'        : ZO-SGD with loss-based adaptive LR
-        - 'sgd_adapt2'       : ZO-SGD with grad-statistics adaptive LR
-        - 'sgd_adapt3'       : ZO-SGD with combined loss+grad adaptive LR
-        - 'adam'             : ZO-Adam (coupled weight decay)
-        - 'adamw'            : ZO-AdamW (decoupled weight decay)
-        - 'adam_adapt2'      : ZO-Adam + gradient-statistics-based LR adaptation
-        - 'adam_adapt3'      : ZO-Adam + bold-driver loss + gradient LR adaptation
-        - 'adamw_adapt2'     : ZO-AdamW + grad-statistics LR adaptation
-        - 'adamw_adapt3'     : ZO-AdamW + bold-driver loss + grad LR adaptation
 
-    Key design choices:
-      - Does NOT assume anything about the model (it may use dropout etc.).
-      - Controls RNG *inside* step() so that f(θ+εz) and f(θ−εz) see
-        identical stochasticity.
-      - Uses a separate per-device Generator for z (noise directions),
-        so model RNG and direction RNG are independent.
     """
 
     def __init__(
@@ -40,15 +26,12 @@ class MeZO(Optimizer):
         lr: float = 1e-3,
         epsilon: float = 1e-3,
         variant: str = "sgd",
-        # variants: 'sgd', 'sgd_adapt', 'sgd_adapt2', 'sgd_adapt3',
-        #           'adam', 'adamw',
-        #           'adam_adapt2', 'adam_adapt3',
-        #           'adamw_adapt2', 'adamw_adapt3'
+        # variants: 'sgd', 'sgd_adapt'
         betas=(0.9, 0.999),
         adam_eps: float = 1e-8,
         weight_decay: float = 0.0,
         projected_grad_clip: float | None = 5.0,
-        # adaptive-LR controls (used by adapt/adapt2/adapt3)
+        # adaptive-LR controls (used by adaptive variants)
         lr_min_factor: float = 0.1,
         lr_max_factor: float = 5.0,
         lr_inc_factor: float = 0.02,
@@ -71,14 +54,6 @@ class MeZO(Optimizer):
         valid_variants = {
             "sgd",
             "sgd_adapt",
-            "sgd_adapt2",
-            "sgd_adapt3",
-            "adam",
-            "adamw",
-            "adam_adapt2",
-            "adam_adapt3",
-            "adamw_adapt2",
-            "adamw_adapt3",
             "adamu",
         }
         if variant not in valid_variants:
@@ -177,12 +152,11 @@ class MeZO(Optimizer):
             variant = group.get("variant", None)
 
             # Map concrete variants to adaptation families
-            if variant in ("sgd_adapt"):
+            if variant in ["sgd_adapt"]:
                 family = "adapt_loss"
-            elif variant in ("adam_adapt2", "adamw_adapt2", "sgd_adapt2"):
+            elif variant in ["adam_adapt2", "adamw_adapt2", "sgd_adapt2"]:
                 family = "adapt_grad"
-            elif variant in ("adam_adapt3", "adamw_adapt3",
-            "adamu", "sgd_adapt3"):
+            elif variant in ["adam_adapt3", "adamw_adapt3", "adamu", "sgd_adapt3"]:
                 family = "adapt_both"
             else:
                 continue  # non-adaptive variant

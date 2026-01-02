@@ -2,18 +2,19 @@
 import argparse
 import json
 import os
-from typing import List, Dict, Any
+from typing import Dict, Any, List, Optional
 
 
 def load_results(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         print(f"No results file at {path}")
+        # Keep compatibility with both schema v1/v2
         return {"schema_version": 1, "runs": {}}
     with open(path, "r") as f:
         return json.load(f)
 
 
-def save_results(path: str, data: Dict[str, Any]):
+def save_results(path: str, data: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
@@ -21,72 +22,64 @@ def save_results(path: str, data: Dict[str, Any]):
     print(f"Updated {path}")
 
 
-def run_matches(cfg: Dict[str, Any], args: argparse.Namespace) -> bool:
-    """
-    Returns True if a run entry should be deleted based on filters.
-    """
+def run_matches(cfg: Dict[str, Any], optimizers: Optional[List[str]], problem: Optional[str],
+                kind: Optional[str], seeds: Optional[List[int]]) -> bool:
+    """Return True if a run entry should be deleted based on filters."""
 
-    # Filter by optimizer
-    if args.optimizers and cfg.get("optimizer") not in args.optimizers:
+    if optimizers is not None and cfg.get("optimizer") not in optimizers:
         return False
 
-    # Filter by problem (toy or ML)
-    if args.problem and cfg.get("problem") != args.problem:
+    if problem is not None and cfg.get("problem") != problem:
         return False
 
-    # Filter by kind (toy or ml)
-    if args.kind and cfg.get("kind") != args.kind:
+    if kind is not None and cfg.get("kind") != kind:
         return False
 
-    # Filter by seed
-    if args.seeds and cfg.get("seed") not in args.seeds:
+    if seeds is not None and cfg.get("seed") not in seeds:
         return False
 
     return True
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Safely reset (delete) selected entries from results.json"
+        description="Safely delete selected entries from the results DB JSON"
     )
     parser.add_argument(
         "--results",
         type=str,
         default="results.json",
-        help="Path to results.json file",
+        help="Path to results DB JSON (default: results.json)",
     )
 
+    # Use '+' so the flag cannot be provided with zero values (prevents accidental 'match all')
     parser.add_argument(
         "--optimizers",
         type=str,
-        nargs="*",
+        nargs="+",
         default=None,
-        help="Optimizer names to clear (e.g. mezo_adam_smooth mezo_adam_tuned)",
+        help="Only remove runs for these optimizers (e.g. mezo_sgd mezo_adamu sgd adam)",
     )
-
     parser.add_argument(
         "--problem",
         type=str,
         default=None,
-        help="Specific problem/dataset to clear (e.g. mnist, quadratic)",
+        help="Only remove runs for this problem/dataset (e.g. mnist, cifar10, quadratic)",
     )
-
     parser.add_argument(
         "--kind",
         type=str,
         default=None,
         choices=["toy", "ml"],
-        help="Whether to clear only toy or ml entries",
+        help="Only remove toy or ml entries",
     )
-
     parser.add_argument(
         "--seeds",
         type=int,
-        nargs="*",
+        nargs="+",
         default=None,
         help="Only remove runs with these seeds",
     )
-
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -95,14 +88,8 @@ def main():
 
     args = parser.parse_args()
 
-    # ---------------- SAFE-BY-DEFAULT CHECK ----------------
-    # If no filters at all, refuse to delete everything.
-    if (
-        args.optimizers is None
-        and args.problem is None
-        and args.kind is None
-        and args.seeds is None
-    ):
+    # Safe-by-default: refuse to delete everything if *no* filter is provided.
+    if args.optimizers is None and args.problem is None and args.kind is None and args.seeds is None:
         print("\n🚫 No filters provided. This script is SAFE-BY-DEFAULT.")
         print("Running without filters would delete ALL runs — so nothing is done.\n")
         print("👉 Provide at least one of:")
@@ -111,18 +98,16 @@ def main():
         print("   --kind toy|ml")
         print("   --seeds 1 2 3\n")
         print("Example:")
-        print("   python reset_results.py --optimizers mezo_adam_tuned --dry-run\n")
+        print("   python reset_results.py --optimizers mezo_sgd --dry-run\n")
         return
-    # --------------------------------------------------------
 
     db = load_results(args.results)
     runs = db.get("runs", {})
 
-    to_delete = []
-
+    to_delete: List[str] = []
     for run_id, entry in runs.items():
         cfg = entry.get("config", {})
-        if run_matches(cfg, args):
+        if run_matches(cfg, args.optimizers, args.problem, args.kind, args.seeds):
             to_delete.append(run_id)
 
     if not to_delete:
@@ -131,7 +116,7 @@ def main():
 
     print(f"Matched {len(to_delete)} entries:")
     for rid in to_delete:
-        cfg = runs[rid]["config"]
+        cfg = runs[rid].get("config", {})
         print(
             f" - {rid[:10]} | {cfg.get('kind')} | {cfg.get('problem')} | "
             f"{cfg.get('optimizer')} | seed={cfg.get('seed')}"
@@ -141,7 +126,6 @@ def main():
         print("\nDry run: nothing deleted.")
         return
 
-    # delete confirmed entries
     for rid in to_delete:
         del runs[rid]
 

@@ -343,6 +343,14 @@ def run_bert_wiki_mlm_problem(
 # ================================================================
 
 def build_optimizer_registry(zo_eps: float) -> Dict[str, Callable]:
+    """Return a mapping from optimizer name -> factory(params, lr).
+
+    Includes first-order baselines, MeZO baselines, and experimental variants:
+      - mezo_sgd
+      - mezo_sgd_adapt
+      - mezo_adamu
+    """
+
     def mezo_factory(variant: str, weight_decay: float = 0.0):
         def _f(params, lr):
             return MeZO(
@@ -354,31 +362,19 @@ def build_optimizer_registry(zo_eps: float) -> Dict[str, Callable]:
             )
         return _f
 
-    registry = {
-        # First-order
-        "sgd":                  lambda params, lr: torch.optim.SGD(params, lr=lr),
-        "sgd_momentum":         lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
-        "adam":                 lambda params, lr: torch.optim.Adam(params, lr=lr),
-        "adamw":                lambda params, lr: torch.optim.AdamW(params, lr=lr),
-        "rmsprop":              lambda params, lr: torch.optim.RMSprop(params, lr=lr),
-        "adagrad":              lambda params, lr: torch.optim.Adagrad(params, lr=lr),
+    registry: Dict[str, Callable] = {
+        # First-order baselines
+        "sgd":          lambda params, lr: torch.optim.SGD(params, lr=lr),
+        "sgd_momentum": lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
+        "adam":         lambda params, lr: torch.optim.Adam(params, lr=lr),
+        "adamw":        lambda params, lr: torch.optim.AdamW(params, lr=lr),
 
-        # Zeroth-order MeZO variants
-        "mezo_sgd":             mezo_factory("sgd"),
-        "mezo_sgd_adapt":      mezo_factory("sgd_adapt"),
-        "mezo_sgd_adapt2":     mezo_factory("sgd_adapt2"),
-        "mezo_sgd_adapt3":     mezo_factory("sgd_adapt3"),
+        # Zeroth-order baselines (MeZO)
+        "mezo_sgd":     mezo_factory("sgd"),
+        "mezo_adamu":   mezo_factory("adamu"),
 
-        "mezo_adam":           mezo_factory("adam"),
-        "mezo_adam_adapt2":    mezo_factory("adam_adapt2"),
-        "mezo_adam_adapt3":    mezo_factory("adam_adapt3"),
-
-        "mezo_adamw":          mezo_factory("adamw"),
-        "mezo_adamw_adapt2":   mezo_factory("adamw_adapt2"),
-        "mezo_adamw_adapt3":   mezo_factory("adamw_adapt3"),
-
-        # ZO-AdaMU baseline (from the ZO-AdaMU paper): adaptive perturbation + momentum.
-        "mezo_adamu":          mezo_factory("adamu"),
+        # Zeroth-order experimental variants
+        "mezo_sgd_adapt":     mezo_factory("sgd_adapt"),
     }
     return registry
 
@@ -516,15 +512,19 @@ def run_toy_problem(
 
     for step in range(steps):
         if is_zo:
+            # ZO optimizers may return a Python float or a Tensor; ignore the return value for logging.
             def closure():
                 return model()
-            loss_val = optimizer.step(closure)
+            _ = optimizer.step(closure)
         else:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss = model()
             loss.backward()
             optimizer.step()
-            loss_val = float(loss.item())
+
+        # Always log the true objective f(theta) at the *current* parameters (comparable across optimizers).
+        with torch.no_grad():
+            loss_val = float(model().item())
 
         losses.append(loss_val)
         if loss_val < best_loss:
@@ -824,7 +824,7 @@ def main():
                         help="Steps for toy problems")
     parser.add_argument("--toy-dim", type=int, default=100,
                         help="Dimensionality for toy problems")
-    parser.add_argument("--toy-lr", type=float, default=1e-2,
+    parser.add_argument("--toy-lr", type=float, default=None,
                         help="Learning rate for toy problems")
     parser.add_argument("--toy-cond", type=float, default=10.0,
                         help="Condition number for quadratic/noisy_quadratic problem")
@@ -840,7 +840,7 @@ def main():
                         help="Epochs for ML problems")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--test-batch-size", type=int, default=512)
-    parser.add_argument("--ml-lr", type=float, default=1e-3,
+    parser.add_argument("--ml-lr", type=float, default=None,
                         help="Learning rate for non-BERT ML problems")
     parser.add_argument("--bert-lr", type=float, default=5e-5,
                         help="Learning rate for BERT MLM problems")
@@ -854,19 +854,9 @@ def main():
             "sgd_momentum",
             "adam",
             "adamw",
-            "rmsprop",
-            "adagrad",
             "mezo_sgd",
-            "mezo_sgd_adapt",
-            "mezo_sgd_adapt2",
-            "mezo_sgd_adapt3",
-            "mezo_adam",
-            "mezo_adamw",
-            "mezo_adam_adapt2",
-            "mezo_adam_adapt3",
-            "mezo_adamw_adapt2",
-            "mezo_adamw_adapt3",
             "mezo_adamu",
+            "mezo_sgd_adapt",
         ],
         help="Optimizers to benchmark",
     )
@@ -891,6 +881,30 @@ def main():
                         help="wandb run name (optional)")
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------
+    # Hyperparameter defaults (only used when the corresponding CLI flag is omitted)
+    # ------------------------------------------------------------
+    def default_toy_lr(opt_name: str) -> float:
+        # Toy problems are small and deterministic, so higher LR is often fine.
+        if opt_name in ("adam", "adamw"):
+            return 1e-2
+        if opt_name.startswith("mezo_"):
+            return 1e-2
+        # SGD / SGD+momentum
+        return 1e-2
+
+    def default_ml_lr(problem_name: str, opt_name: str) -> float:
+        # Reasonable, widely-used starting points for the small CNN/MLP baselines.
+        if opt_name in ["adam", "adamw"]:
+            return 1e-3
+        if opt_name in ["mezo_sgd", "mezo_adamu"]:
+            return 1e-4
+        if opt_name in ["mezo_sgd_adapt"]:
+            return 1e-3
+        # SGD family: higher LR typically needed for CIFAR-10 vs MNIST.
+        return 1e-1 if problem_name == "cifar10" else 5e-2
+
 
     if args.device == "auto":
         if torch.cuda.is_available():
@@ -937,7 +951,7 @@ def main():
                     extra={
                         "dim": dim,
                         "steps": args.toy_steps,
-                        "toy_lr": args.toy_lr,
+                        "toy_lr": (args.toy_lr if args.toy_lr is not None else default_toy_lr(opt_name)),
                         "toy_cond": args.toy_cond,
                     },
                 )
@@ -957,7 +971,7 @@ def main():
                     opt_fn=opt_fn,
                     dim=dim,
                     steps=args.toy_steps,
-                    lr=args.toy_lr,
+                    lr=(args.toy_lr if args.toy_lr is not None else default_toy_lr(opt_name)),
                     device=device,
                     seed=seed,
                     cond=args.toy_cond,
@@ -988,7 +1002,7 @@ def main():
                         "epochs": args.epochs,
                         "batch_size": args.batch_size,
                         "test_batch_size": args.test_batch_size,
-                        "ml_lr": args.ml_lr,
+                        "ml_lr": (args.ml_lr if args.ml_lr is not None else default_ml_lr(problem_name, opt_name)),
                     }
 
                 config = make_run_config(
@@ -1030,7 +1044,7 @@ def main():
                         opt_name=opt_name,
                         opt_fn=opt_fn,
                         epochs=args.epochs,
-                        lr=args.ml_lr,
+                        lr=(args.ml_lr if args.ml_lr is not None else default_ml_lr(problem_name, opt_name)),
                         batch_size=args.batch_size,
                         test_batch_size=args.test_batch_size,
                         device=device,
