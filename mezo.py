@@ -33,8 +33,8 @@ class MeZO(Optimizer):
         projected_grad_clip: float | None = 5.0,
         # adaptive-LR controls (used by adaptive variants)
         lr_min_factor: float = 0.1,
-        lr_max_factor: float = 5.0,
-        lr_inc_factor: float = 0.02,
+        lr_max_factor: float = 10.0,
+        lr_inc_factor: float = 0.2,
         lr_dec_factor: float = 0.5,
         adapt_warmup: int = 10,
         adapt_every: int = 5,

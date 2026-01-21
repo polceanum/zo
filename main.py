@@ -1029,6 +1029,8 @@ def main():
         return 1e-3
 
     def default_ml_lr(problem_name: str, opt_name: str) -> float:
+        if 'mezo' in opt_name and not 'adapt' in opt_name:
+            return 1e-4
         return 1e-3
 
     if args.device == "auto":
