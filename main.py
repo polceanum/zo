@@ -24,6 +24,10 @@ from problems import (
     NoisyQuadraticProblem,
     SimpleCNN,
     Cifar10CNN,
+    Cifar100CNN,
+    TinyImageNetCNN,
+    MLPClassifier,
+    VisionTransformerClassifier,
     get_classification_loaders,
 )
 
@@ -655,6 +659,7 @@ def test_classification(
 
 def run_classification_problem(
     dataset: str,
+    arch: str,
     opt_name: str,
     opt_fn: Callable,
     epochs: int,
@@ -666,27 +671,131 @@ def run_classification_problem(
     seed: int,
     wandb_run=None,
 ) -> Dict:
+    """
+    Train and evaluate an image classification model on the given dataset using the
+    specified architecture. Supports multiple architectures (CNN, MLP, Transformer)
+    per dataset. Returns a dictionary of results including best and final metrics.
+
+    Parameters
+    ----------
+    dataset : str
+        The name of the dataset (e.g. mnist, fmnist, cifar10, cifar100, tinyimagenet).
+    arch : str
+        The model architecture to use. One of "cnn", "mlp", "transformer". Aliases
+        like "vit" for transformer are accepted.
+    opt_name : str
+        The name of the optimizer (for logging purposes).
+    opt_fn : Callable
+        A function returning a PyTorch optimizer when passed model parameters and
+        learning rate.
+    epochs : int
+        Number of training epochs.
+    lr : float
+        Learning rate for the optimizer.
+    batch_size : int
+        Training batch size.
+    test_batch_size : int
+        Testing batch size.
+    device : torch.device
+        Device to run on.
+    use_cuda : bool
+        Whether CUDA is available (affects dataloader kwargs).
+    seed : int
+        Random seed for reproducibility.
+    wandb_run : optional
+        An active Weights & Biases run for logging.
+
+    Returns
+    -------
+    Dict
+        A dictionary containing metrics such as final and best test accuracy and loss,
+        along with timing information and the architecture used.
+    """
     torch.manual_seed(seed)
 
+    # Obtain dataloaders
     train_loader, test_loader = get_classification_loaders(
         dataset, batch_size, test_batch_size, use_cuda=use_cuda
     )
 
-    if dataset in ("mnist", "fmnist"):
-        model = SimpleCNN().to(device)
-    elif dataset == "cifar10":
-        model = Cifar10CNN().to(device)
+    # Normalize architecture string and decide which model to instantiate
+    arch_norm = arch.lower()
+    if arch_norm in ("cnn",):
+        # Select dataset-specific CNN
+        if dataset in ("mnist", "fmnist"):
+            model = SimpleCNN()
+        elif dataset == "cifar10":
+            model = Cifar10CNN()
+        elif dataset == "cifar100":
+            model = Cifar100CNN()
+        elif dataset in ["tinyimagenet", "tiny-imagenet", "tiny_imagenet", "tiny-imagenet-200", "tinynet"]:
+            model = TinyImageNetCNN()
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}")
+    elif arch_norm in ("mlp",):
+        # Determine image shape and classes for MLP
+        if dataset in ("mnist", "fmnist"):
+            in_channels = 1
+            img_size = (28, 28)
+            num_classes = 10
+        elif dataset == "cifar10":
+            in_channels = 3
+            img_size = (32, 32)
+            num_classes = 10
+        elif dataset == "cifar100":
+            in_channels = 3
+            img_size = (32, 32)
+            num_classes = 100
+        elif dataset in ["tinyimagenet", "tiny-imagenet", "tiny_imagenet", "tiny-imagenet-200", "tinynet"]:
+            in_channels = 3
+            img_size = (64, 64)
+            num_classes = 200
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}")
+        model = MLPClassifier(in_channels=in_channels, img_size=img_size, num_classes=num_classes)
+    elif arch_norm in ("transformer", "vit", "visiontransformer", "vision_transformer"):
+        # Determine image shape, patch size, and classes for ViT
+        if dataset in ("mnist", "fmnist"):
+            in_channels = 1
+            img_size = (28, 28)
+            num_classes = 10
+            patch_size = 4  # 28/4=7 patches per side
+        elif dataset == "cifar10":
+            in_channels = 3
+            img_size = (32, 32)
+            num_classes = 10
+            patch_size = 4  # 32/4=8 patches per side
+        elif dataset == "cifar100":
+            in_channels = 3
+            img_size = (32, 32)
+            num_classes = 100
+            patch_size = 4
+        elif dataset in ["tinyimagenet", "tiny-imagenet", "tiny_imagenet", "tiny-imagenet-200", "tinynet"]:
+            in_channels = 3
+            img_size = (64, 64)
+            num_classes = 200
+            patch_size = 8  # 64/8=8 patches per side
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}")
+        model = VisionTransformerClassifier(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            num_classes=num_classes,
+        )
     else:
-        raise ValueError(f"Unknown dataset: {dataset}")
+        raise ValueError(f"Unknown architecture: {arch}")
+
+    model = model.to(device)
 
     optimizer = opt_fn(model.parameters(), lr=lr)
     from mezo import MeZO as MeZOClass  # avoid confusion in isinstance
     is_zo = isinstance(optimizer, MeZOClass)
 
     start_time = time.time()
-    best_acc = 0.0
-    best_test_loss = float("inf")
-    last_test_stats = None
+    best_acc: float = 0.0
+    best_test_loss: float = float("inf")
+    last_test_stats: Optional[Dict[str, float]] = None
 
     for epoch in range(1, epochs + 1):
         train_loss = train_epoch_classification(model, optimizer, train_loader, device, is_zo)
@@ -699,7 +808,7 @@ def run_classification_problem(
             best_test_loss = test_stats["loss"]
 
         print(
-            f"[{dataset}] Opt={opt_name} Epoch={epoch}/{epochs} "
+            f"[{dataset}/{arch_norm}] Opt={opt_name} Epoch={epoch}/{epochs} "
             f"TrainLoss={train_loss:.4f} "
             f"TestLoss={test_stats['loss']:.4f} "
             f"TestAcc={test_stats['accuracy']:.2f}%",
@@ -712,6 +821,7 @@ def run_classification_problem(
                 {
                     "kind": "ml",
                     "dataset": dataset,
+                    "arch": arch_norm,
                     "optimizer": opt_name,
                     "epoch": epoch,
                     "train_loss": train_loss,
@@ -722,14 +832,16 @@ def run_classification_problem(
 
     elapsed = time.time() - start_time
 
+    # Build result dict including arch to differentiate across architectures
     result = {
         "kind": "ml",
         "problem": dataset,
+        "arch": arch_norm,
         "optimizer": opt_name,
         "epochs": epochs,
         "seed": seed,
-        "final_test_loss": last_test_stats["loss"],
-        "final_test_acc": last_test_stats["accuracy"],
+        "final_test_loss": last_test_stats["loss"] if last_test_stats else float("inf"),
+        "final_test_acc": last_test_stats["accuracy"] if last_test_stats else 0.0,
         "best_test_loss": best_test_loss,
         "best_test_acc": best_acc,
         "time_sec": elapsed,
@@ -748,16 +860,24 @@ def run_classification_problem(
 # ================================================================
 
 def print_summaries(all_results: List[Dict]):
+    """
+    Pretty-print a summary of results grouped by task and (for ML problems)
+    architecture. For toy problems, results are grouped by problem name as
+    before. For ML problems, results are grouped by the dataset and the
+    architecture used so that different architectures are reported separately.
+    """
+    # Group results by kind, problem, and architecture (if present)
     by_problem: Dict[tuple, List[Dict]] = {}
     for r in all_results:
-        key = (r["kind"], r["problem"])
+        # Use None as default architecture for toy problems or older runs
+        key = (r["kind"], r["problem"], r.get("arch"))
         by_problem.setdefault(key, []).append(r)
 
     print("\n" + "=" * 72)
     print("SUMMARY BY TASK")
     print("=" * 72)
 
-    for (kind, problem), results in sorted(by_problem.items()):
+    for (kind, problem, arch), results in sorted(by_problem.items()):
         print()
         if kind == "toy":
             header = f"[TOY] {problem}"
@@ -773,7 +893,11 @@ def print_summaries(all_results: List[Dict]):
                     f"{r['time_sec']:>10.2f}"
                 )
         else:
-            header = f"[ML] {problem}"
+            # For ML tasks, include architecture in the header if available
+            if arch is None:
+                header = f"[ML] {problem}"
+            else:
+                header = f"[ML] {problem} ({arch})"
             print(header)
             print("-" * len(header))
             print(f"{'optimizer':<14} {'final_acc[%]':>14} {'best_acc[%]':>14} "
@@ -833,8 +957,11 @@ def main():
         "--ml-problems",
         type=str,
         nargs="*",
-        default=["mnist", "fmnist", "cifar10"], # "bert_wiki_mlm"
-        help="ML problems: mnist, fmnist, cifar10, bert_wiki_mlm",
+        default=["mnist", "fmnist", "cifar10", "cifar100", "tinyimagenet"],  # "bert_wiki_mlm"
+        help=(
+            "ML problems: mnist, fmnist, cifar10, cifar100, tinyimagenet, bert_wiki_mlm. "
+            "Aliases for tinyimagenet include tiny-imagenet, tiny_imagenet, tiny-imagenet-200, tinynet."
+        ),
     )
     parser.add_argument("--epochs", type=int, default=10,
                         help="Epochs for ML problems")
@@ -859,6 +986,19 @@ def main():
             "mezo_sgd_adapt",
         ],
         help="Optimizers to benchmark",
+    )
+
+    # Architecture options for ML problems
+    parser.add_argument(
+        "--archs",
+        type=str,
+        nargs="*",
+        default=["mlp", "cnn", "transformer"],
+        help=(
+            "Model architectures to benchmark for ML problems. Choices include: "
+            "cnn (dataset-specific small CNN), mlp (fully connected network), "
+            "transformer/vit (vision transformer)."
+        ),
     )
 
     parser.add_argument("--results-path", type=str, default="results.json",
@@ -886,25 +1026,10 @@ def main():
     # Hyperparameter defaults (only used when the corresponding CLI flag is omitted)
     # ------------------------------------------------------------
     def default_toy_lr(opt_name: str) -> float:
-        # Toy problems are small and deterministic, so higher LR is often fine.
-        if opt_name in ("adam", "adamw"):
-            return 1e-2
-        if opt_name.startswith("mezo_"):
-            return 1e-2
-        # SGD / SGD+momentum
-        return 1e-2
+        return 1e-3
 
     def default_ml_lr(problem_name: str, opt_name: str) -> float:
-        # Reasonable, widely-used starting points for the small CNN/MLP baselines.
-        if opt_name in ["adam", "adamw"]:
-            return 1e-3
-        if opt_name in ["mezo_sgd", "mezo_adamu"]:
-            return 1e-4
-        if opt_name in ["mezo_sgd_adapt"]:
-            return 1e-3
-        # SGD family: higher LR typically needed for CIFAR-10 vs MNIST.
-        return 1e-1 if problem_name == "cifar10" else 5e-2
-
+        return 1e-3
 
     if args.device == "auto":
         if torch.cuda.is_available():
@@ -987,75 +1112,85 @@ def main():
     # ----------------- ML problems ------------------
     for seed in args.seeds:
         for dataset in args.ml_problems:
-            for opt_name in optimizers_to_run:
-                opt_fn = opt_registry[opt_name]
+            for arch in args.archs:
+                for opt_name in optimizers_to_run:
+                    opt_fn = opt_registry[opt_name]
 
-                if dataset == "bert_wiki_mlm":
-                    extra_cfg = {
-                        "epochs": args.epochs,
-                        "batch_size": args.batch_size,
-                        "test_batch_size": args.test_batch_size,
-                        "bert_lr": args.bert_lr,
-                    }
-                else:
-                    extra_cfg = {
-                        "epochs": args.epochs,
-                        "batch_size": args.batch_size,
-                        "test_batch_size": args.test_batch_size,
-                        "ml_lr": (args.ml_lr if args.ml_lr is not None else default_ml_lr(problem_name, opt_name)),
-                    }
+                    # Determine extra configuration; default LR depends on dataset and optimizer
+                    if dataset == "bert_wiki_mlm":
+                        extra_cfg = {
+                            "epochs": args.epochs,
+                            "batch_size": args.batch_size,
+                            "test_batch_size": args.test_batch_size,
+                            "bert_lr": args.bert_lr,
+                            "arch": arch,
+                        }
+                    else:
+                        # Use dataset-specific default learning rate if not provided
+                        lr_default = args.ml_lr if args.ml_lr is not None else default_ml_lr(dataset, opt_name)
+                        extra_cfg = {
+                            "epochs": args.epochs,
+                            "batch_size": args.batch_size,
+                            "test_batch_size": args.test_batch_size,
+                            "ml_lr": lr_default,
+                            "arch": arch,
+                        }
 
-                config = make_run_config(
-                    kind="ml",
-                    problem=dataset,
-                    optimizer_name=opt_name,
-                    seed=seed,
-                    device=device,
-                    args=args,
-                    extra=extra_cfg,
-                )
-                run_id = run_id_from_config(config)
-
-                if run_id in runs_store:
-                    print(f"\n[ML] Dataset={dataset} Opt={opt_name} Seed={seed} "
-                          f"=> SKIP (cached in {args.results_path})")
-                    cached = runs_store[run_id]["metrics"]
-                    all_results.append(cached)
-                    continue
-
-                print(f"\n[ML] Dataset={dataset} Opt={opt_name} Seed={seed}")
-                if dataset == "bert_wiki_mlm":
-                    res = run_bert_wiki_mlm_problem(
-                        dataset=dataset,
-                        opt_name=opt_name,
-                        opt_fn=opt_fn,
-                        epochs=args.epochs,
-                        lr=args.bert_lr,
-                        batch_size=args.batch_size,
-                        test_batch_size=args.test_batch_size,
-                        device=device,
-                        use_cuda=use_cuda,
+                    # Build run config including architecture so caching differentiates across archs
+                    config = make_run_config(
+                        kind="ml",
+                        problem=dataset,
+                        optimizer_name=opt_name,
                         seed=seed,
-                        wandb_run=wandb_run,
-                    )
-                else:
-                    res = run_classification_problem(
-                        dataset=dataset,
-                        opt_name=opt_name,
-                        opt_fn=opt_fn,
-                        epochs=args.epochs,
-                        lr=(args.ml_lr if args.ml_lr is not None else default_ml_lr(problem_name, opt_name)),
-                        batch_size=args.batch_size,
-                        test_batch_size=args.test_batch_size,
                         device=device,
-                        use_cuda=use_cuda,
-                        seed=seed,
-                        wandb_run=wandb_run,
+                        args=args,
+                        extra=extra_cfg,
                     )
+                    run_id = run_id_from_config(config)
 
-                all_results.append(res)
-                runs_store[run_id] = {"config": config, "metrics": res}
-                save_results_db(args.results_path, results_db)
+                    # Check if this run is cached
+                    if run_id in runs_store:
+                        print(f"\n[ML] Dataset={dataset} Arch={arch} Opt={opt_name} Seed={seed} "
+                              f"=> SKIP (cached in {args.results_path})")
+                        cached = runs_store[run_id]["metrics"]
+                        all_results.append(cached)
+                        continue
+
+                    print(f"\n[ML] Dataset={dataset} Arch={arch} Opt={opt_name} Seed={seed}")
+                    if dataset == "bert_wiki_mlm":
+                        res = run_bert_wiki_mlm_problem(
+                            dataset=dataset,
+                            opt_name=opt_name,
+                            opt_fn=opt_fn,
+                            epochs=args.epochs,
+                            lr=args.bert_lr,
+                            batch_size=args.batch_size,
+                            test_batch_size=args.test_batch_size,
+                            device=device,
+                            use_cuda=use_cuda,
+                            seed=seed,
+                            wandb_run=wandb_run,
+                        )
+                    else:
+                        lr_run = args.ml_lr if args.ml_lr is not None else default_ml_lr(dataset, opt_name)
+                        res = run_classification_problem(
+                            dataset=dataset,
+                            arch=arch,
+                            opt_name=opt_name,
+                            opt_fn=opt_fn,
+                            epochs=args.epochs,
+                            lr=lr_run,
+                            batch_size=args.batch_size,
+                            test_batch_size=args.test_batch_size,
+                            device=device,
+                            use_cuda=use_cuda,
+                            seed=seed,
+                            wandb_run=wandb_run,
+                        )
+
+                    all_results.append(res)
+                    runs_store[run_id] = {"config": config, "metrics": res}
+                    save_results_db(args.results_path, results_db)
 
     print_summaries(all_results)
 
